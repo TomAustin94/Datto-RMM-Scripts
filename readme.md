@@ -47,16 +47,17 @@ Basic sync (creates the IT Glue Password record if it doesn’t exist):
 ```powershell
 .\scripts\Sync-EntraLapsToITGlue.ps1 `
   -DeviceName "PC-001" `
-  -ITGlueApiKey $env:ITGLUE_API_KEY `
   -ITGlueOrganizationId 123456
 ```
+
+If running from Datto RMM as a component, set an environment/component variable like `ITGLUE_API_KEY`
+and omit `-ITGlueApiKey`.
 
 Preview changes without writing to IT Glue:
 
 ```powershell
 .\scripts\Sync-EntraLapsToITGlue.ps1 `
   -DeviceName "PC-001" `
-  -ITGlueApiKey $env:ITGLUE_API_KEY `
   -ITGlueOrganizationId 123456 `
   -WhatIf
 ```

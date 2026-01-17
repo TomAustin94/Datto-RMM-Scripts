@@ -19,7 +19,8 @@ The local admin account name to select from the returned LAPS credentials (defau
 If not found, the script falls back to the first credential returned.
 
 .PARAMETER ITGlueApiKey
-IT Glue API key (x-api-key header). Consider using a secret manager and passing it in at runtime.
+IT Glue API key (x-api-key header). If not provided, the script will try to read it from an environment
+variable (recommended for Datto RMM components) such as ITGLUE_API_KEY.
 
 .PARAMETER ITGlueOrganizationId
 IT Glue organization ID that owns the Password record.
@@ -72,8 +73,7 @@ param(
   [ValidateNotNullOrEmpty()]
   [string] $LocalAdminAccountName = "Administrator",
 
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
+  [Parameter()]
   [string] $ITGlueApiKey,
 
   [Parameter(Mandatory = $true)]
@@ -120,6 +120,15 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+
+$DefaultITGlueApiKey = $env:ITGLUE_API_KEY
+if (-not $DefaultITGlueApiKey) { $DefaultITGlueApiKey = $env:ITGlueApiKey }
+if (-not $DefaultITGlueApiKey) { $DefaultITGlueApiKey = $env:IT_GLUE_API_KEY }
+
+if (-not $ITGlueApiKey) { $ITGlueApiKey = $DefaultITGlueApiKey }
+if (-not $ITGlueApiKey) {
+  throw "IT Glue API key not provided. Pass -ITGlueApiKey or set environment variable ITGLUE_API_KEY."
+}
 
 function ConvertTo-GraphODataStringLiteral {
   param([Parameter(Mandatory = $true)][string] $Value)
