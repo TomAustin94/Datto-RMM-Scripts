@@ -31,6 +31,7 @@ Permissions (scopes requested by the script):
 
 - `DeviceLocalCredential.Read.All`
 - `Device.Read.All`
+- `DeviceManagementManagedDevices.Read.All` (only when auto-associating an IT Glue Configuration by serial number via Intune)
 
 You (or an admin) may need to grant consent depending on your tenant policies.
 
@@ -81,6 +82,9 @@ Use a specific local admin account name and a custom IT Glue Password record nam
 - `-ITGlueBaseUri`: IT Glue API base URL (default: `https://api.itglue.com`).
 - `-ITGluePasswordCategoryId`: Optional password category ID to set on create/update.
 - `-ITGlueResourceType` / `-ITGlueResourceId`: Optional association (commonly `Configurations` + configuration ID).
+- `-ConfigurationSerialNumber`: Optional serial number override used to find an IT Glue Configuration item.
+- `-DisableConfigurationLookup`: Skip auto-association to an IT Glue Configuration item by serial number when `-ITGlueResourceId` is not provided.
+- `-RequireConfigurationMatch`: Fail if the script cannot uniquely match an IT Glue Configuration by serial number.
 - `-ITGlueNotes`: Optional additional notes; Graph timestamps are appended when available.
 - `-TenantId`: Optional tenant ID to use when connecting to Graph.
 
@@ -90,12 +94,14 @@ The script returns an object including:
 
 - `DeviceName`, `DeviceId`, `AccountName`, `PasswordExpirationDateTime`
 - `ITGlueOrganizationId`, `ITGluePasswordName`, `ITGluePasswordId`
+- `ITGlueResourceType`, `ITGlueResourceId` (resolved association, when available)
 
 ## Notes / limitations
 
 - Uses a Microsoft Graph **beta** endpoint (`/beta/deviceLocalCredentials/...`), which may change.
 - The device lookup is by exact `displayName`. If multiple devices share the same name, the script stops and asks for a unique name.
 - IT Glue upsert is done by searching Passwords by **name** within the given organization (first match is used).
+- If `-ITGlueResourceId` is not provided, the script attempts to associate the Password to an IT Glue **Configuration** by looking up the device serial number in Graph and matching `filter[serial_number]` in IT Glue.
 
 ## Security recommendations
 
