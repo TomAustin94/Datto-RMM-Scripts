@@ -14,6 +14,9 @@ Prereqs:
 .PARAMETER DeviceName
 Entra ID device display name (e.g., "PC-001").
 
+.PARAMETER AllDevices
+Enumerate all Entra devices with LAPS credentials available and sync them in bulk.
+
 .PARAMETER LocalAdminAccountName
 The local admin account name to select from the returned LAPS credentials (default: "Administrator").
 If not found, the script falls back to the first credential returned.
@@ -26,7 +29,11 @@ variable (recommended for Datto RMM components) such as ITGLUE_API_KEY.
 IT Glue organization ID that owns the Password record.
 
 .PARAMETER ITGluePasswordName
-IT Glue Password record name to upsert. Default: "<DeviceName> - LAPS".
+IT Glue Password record name to upsert (single-device mode). If not provided, the name is generated from
+-ITGluePasswordNameTemplate.
+
+.PARAMETER ITGluePasswordNameTemplate
+Template used to generate per-device IT Glue Password names. Default: "{DeviceName} - LAPS".
 
 .PARAMETER ITGlueBaseUri
 IT Glue API base URI. Default: https://api.itglue.com
@@ -63,11 +70,14 @@ Optional Entra tenant ID to use for Connect-MgGraph.
 .\scripts\Sync-EntraLapsToITGlue.ps1 -DeviceName "PC-001" -LocalAdminAccountName "LAPSAdmin" -ITGlueApiKey (Get-Content .\itglue.key -Raw) -ITGlueOrganizationId 123456 -ITGluePasswordName "PC-001 / LAPS" -WhatIf
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true, PositionalBinding = $false)]
+[CmdletBinding(SupportsShouldProcess = $true, PositionalBinding = $false, DefaultParameterSetName = "Single")]
 param(
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $true, ParameterSetName = "Single")]
   [ValidateNotNullOrEmpty()]
   [string] $DeviceName,
+
+  [Parameter(Mandatory = $true, ParameterSetName = "All")]
+  [switch] $AllDevices,
 
   [Parameter()]
   [ValidateNotNullOrEmpty()]
@@ -82,7 +92,11 @@ param(
 
   [Parameter()]
   [ValidateNotNullOrEmpty()]
-  [string] $ITGluePasswordName = "$DeviceName - LAPS",
+  [string] $ITGluePasswordName,
+
+  [Parameter()]
+  [ValidateNotNullOrEmpty()]
+  [string] $ITGluePasswordNameTemplate = "{DeviceName} - LAPS",
 
   [Parameter()]
   [ValidateNotNullOrEmpty()]
@@ -130,6 +144,48 @@ if (-not $ITGlueApiKey) {
   throw "IT Glue API key not provided. Pass -ITGlueApiKey or set environment variable ITGLUE_API_KEY."
 }
 
+if ($PSCmdlet.ParameterSetName -eq "All") {
+  if ($ITGluePasswordName) {
+    throw "In -AllDevices mode, do not pass -ITGluePasswordName (it would cause all devices to overwrite the same record). Use -ITGluePasswordNameTemplate instead."
+  }
+  if ($ConfigurationSerialNumber) {
+    throw "In -AllDevices mode, do not pass -ConfigurationSerialNumber (it would associate all devices to the same serial/config). Let the script resolve serials per-device, or use -DisableConfigurationLookup."
+  }
+}
+
+function Ensure-MgGraphConnection {
+  param(
+    [Parameter(Mandatory = $true)][string[]] $Scopes,
+    [Parameter()][string] $TenantId
+  )
+
+  if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+    throw "Microsoft Graph PowerShell SDK not found. Install with: Install-Module Microsoft.Graph -Scope CurrentUser"
+  }
+
+  Import-Module Microsoft.Graph.Authentication -ErrorAction Stop | Out-Null
+  Import-Module Microsoft.Graph.Devices -ErrorAction Stop | Out-Null
+
+  $ctx = $null
+  try { $ctx = Get-MgContext } catch { }
+
+  $needConnect = $true
+  if ($ctx -and $ctx.Account) {
+    $granted = @()
+    try { $granted = @($ctx.Scopes) } catch { }
+    $missing = @($Scopes | Where-Object { $granted -notcontains $_ })
+    if (-not $missing) { $needConnect = $false }
+  }
+
+  if ($needConnect) {
+    if ($TenantId) {
+      Connect-MgGraph -TenantId $TenantId -Scopes $Scopes | Out-Null
+    } else {
+      Connect-MgGraph -Scopes $Scopes | Out-Null
+    }
+  }
+}
+
 function ConvertTo-GraphODataStringLiteral {
   param([Parameter(Mandatory = $true)][string] $Value)
   return $Value.Replace("'", "''")
@@ -153,58 +209,84 @@ function Get-EntraLapsCredential {
   param(
     [Parameter(Mandatory = $true)][string] $DeviceName,
     [Parameter(Mandatory = $true)][string] $LocalAdminAccountName,
-    [Parameter()][string] $TenantId,
-    [Parameter()][switch] $IncludeManagedDeviceSerialLookup
+    [Parameter()][string] $TenantId
   )
-
-  if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-    throw "Microsoft Graph PowerShell SDK not found. Install with: Install-Module Microsoft.Graph -Scope CurrentUser"
-  }
-
-  Import-Module Microsoft.Graph.Authentication -ErrorAction Stop | Out-Null
-  Import-Module Microsoft.Graph.Devices -ErrorAction Stop | Out-Null
-
-  $scopes = @("DeviceLocalCredential.Read.All", "Device.Read.All")
-  if ($IncludeManagedDeviceSerialLookup) {
-    $scopes += "DeviceManagementManagedDevices.Read.All"
-  }
-  if ($TenantId) {
-    Connect-MgGraph -TenantId $TenantId -Scopes $scopes | Out-Null
-  } else {
-    Connect-MgGraph -Scopes $scopes | Out-Null
-  }
 
   $escapedName = ConvertTo-GraphODataStringLiteral -Value $DeviceName
   $devices = Get-MgDevice -Filter "displayName eq '$escapedName'" -All -Property "id,deviceId,displayName,physicalIds"
   if (-not $devices) { throw "No Entra ID device found with displayName '$DeviceName'." }
   if ($devices.Count -gt 1) { throw "Multiple Entra ID devices found with displayName '$DeviceName'. Use a unique name." }
 
-  $deviceId = $devices[0].Id
-  $azureAdDeviceId = $devices[0].DeviceId
-  $physicalIds = $devices[0].PhysicalIds
+  return Get-EntraLapsCredentialByDevice -Device $devices[0] -LocalAdminAccountName $LocalAdminAccountName
+}
+
+function Get-EntraLapsCredentialByDevice {
+  param(
+    [Parameter(Mandatory = $true)][object] $Device,
+    [Parameter(Mandatory = $true)][string] $LocalAdminAccountName
+  )
+
+  $deviceId = $Device.Id
+  $azureAdDeviceId = $Device.DeviceId
+  $physicalIds = $Device.PhysicalIds
+  $deviceName = $Device.DisplayName
+
   $uri = "https://graph.microsoft.com/beta/deviceLocalCredentials/$deviceId"
   $response = Invoke-MgGraphRequest -Method GET -Uri $uri
 
-  if (-not $response.credentials) { throw "No LAPS credentials returned for device '$DeviceName' ($deviceId)." }
+  if (-not $response.credentials) { throw "No LAPS credentials returned for device '$deviceName' ($deviceId)." }
 
   $selected = @($response.credentials | Where-Object { $_.accountName -eq $LocalAdminAccountName })
   if (-not $selected) { $selected = @($response.credentials | Select-Object -First 1) }
 
   $cred = $selected | Select-Object -First 1
-  if (-not $cred.passwordBase64) { throw "Graph did not return passwordBase64 for device '$DeviceName'." }
+  if (-not $cred.passwordBase64) { throw "Graph did not return passwordBase64 for device '$deviceName'." }
 
   $password = ConvertFrom-Base64StringToText -Base64 $cred.passwordBase64
 
   [PSCustomObject]@{
     DeviceId                   = $deviceId
     AzureAdDeviceId            = $azureAdDeviceId
-    DeviceName                 = $DeviceName
+    DeviceName                 = $deviceName
     PhysicalIds                = $physicalIds
     AccountName                = $cred.accountName
     Password                   = $password
     BackupDateTime             = $cred.backupDateTime
     PasswordExpirationDateTime = $cred.passwordExpirationDateTime
   }
+}
+
+function Get-GraphPagedItems {
+  param(
+    [Parameter(Mandatory = $true)][string] $Uri
+  )
+
+  $items = @()
+  $next = $Uri
+  while ($next) {
+    $res = Invoke-MgGraphRequest -Method GET -Uri $next
+    if ($res.value) { $items += @($res.value) }
+    $next = $null
+    try { $next = $res.'@odata.nextLink' } catch { }
+  }
+  return $items
+}
+
+function Get-EntraDevicesWithLapsEnabled {
+  $uri = "https://graph.microsoft.com/beta/deviceLocalCredentials?`$select=id&`$top=999"
+  $entries = @(Get-GraphPagedItems -Uri $uri)
+  if (-not $entries) { return @() }
+
+  $devices = @()
+  foreach ($entry in $entries) {
+    if (-not $entry.id) { continue }
+    try {
+      $devices += Get-MgDevice -DeviceId $entry.id -Property "id,deviceId,displayName,physicalIds"
+    } catch {
+      Write-Warning "Unable to read device '$($entry.id)' from Graph. Skipping. Error: $($_.Exception.Message)"
+    }
+  }
+  return $devices
 }
 
 function Get-EntraDeviceSerialNumber {
@@ -423,107 +505,143 @@ function Set-ITGluePassword {
   return Invoke-ITGlueRequest -Method PATCH -BaseUri $BaseUri -ApiKey $ApiKey -Path "passwords/$PasswordId" -Body $body
 }
 
-$includeManagedDeviceSerialLookup =
+function Resolve-ITGluePasswordName {
+  param(
+    [Parameter()][string] $ExplicitName,
+    [Parameter(Mandatory = $true)][string] $Template,
+    [Parameter(Mandatory = $true)][string] $DeviceName
+  )
+
+  if ($ExplicitName) { return $ExplicitName }
+  return $Template.Replace("{DeviceName}", $DeviceName)
+}
+
+function Sync-DeviceLapsToITGlue {
+  param(
+    [Parameter(Mandatory = $true)][object] $Device
+  )
+
+  $laps = Get-EntraLapsCredentialByDevice -Device $Device -LocalAdminAccountName $LocalAdminAccountName
+
+  $resolvedPasswordName = Resolve-ITGluePasswordName -ExplicitName $ITGluePasswordName -Template $ITGluePasswordNameTemplate -DeviceName $laps.DeviceName
+
+  $resolvedResourceType = $ITGlueResourceType
+  $resolvedResourceId = $ITGlueResourceId
+
+  if (
+    (-not $DisableConfigurationLookup) -and
+    (-not $resolvedResourceId) -and
+    ((-not $resolvedResourceType) -or ($resolvedResourceType -eq "Configurations"))
+  ) {
+    $serial = $ConfigurationSerialNumber
+    if (-not $serial) {
+      $serial = Get-EntraDeviceSerialNumber -AzureAdDeviceId $laps.AzureAdDeviceId -PhysicalIds $laps.PhysicalIds -DeviceName $laps.DeviceName
+    }
+
+    if ($serial) {
+      try {
+        $config = Get-ITGlueConfigurationBySerialNumber -BaseUri $ITGlueBaseUri -ApiKey $ITGlueApiKey -OrganizationId $ITGlueOrganizationId -SerialNumber $serial
+        if ($config) {
+          if (-not $resolvedResourceType) { $resolvedResourceType = "Configurations" }
+          $resolvedResourceId = [int]$config.id
+        } elseif ($RequireConfigurationMatch) {
+          throw "No IT Glue Configuration found with serial number '$serial' in org $ITGlueOrganizationId."
+        } else {
+          Write-Warning "No IT Glue Configuration found with serial number '$serial' in org $ITGlueOrganizationId. Continuing without resource association."
+        }
+      } catch {
+        if ($RequireConfigurationMatch) { throw }
+        Write-Warning "Failed to resolve IT Glue Configuration by serial number. Continuing without resource association. Error: $($_.Exception.Message)"
+      }
+    } elseif ($RequireConfigurationMatch) {
+      throw "Unable to determine device serial number from Microsoft Graph. Pass -ConfigurationSerialNumber, or disable serial-based association with -DisableConfigurationLookup."
+    } else {
+      Write-Warning "Unable to determine device serial number from Microsoft Graph; skipping IT Glue Configuration association."
+    }
+  }
+
+  $noteParts = @()
+  if ($ITGlueNotes) { $noteParts += $ITGlueNotes.Trim() }
+  if ($laps.BackupDateTime) { $noteParts += "Graph backupDateTime: $($laps.BackupDateTime)" }
+  if ($laps.PasswordExpirationDateTime) { $noteParts += "Graph passwordExpirationDateTime: $($laps.PasswordExpirationDateTime)" }
+  $combinedNotes = ($noteParts -join "`n").Trim()
+  if (-not $combinedNotes) { $combinedNotes = $null }
+
+  $existing = Get-ITGluePasswordByName -BaseUri $ITGlueBaseUri -ApiKey $ITGlueApiKey -OrganizationId $ITGlueOrganizationId -Name $resolvedPasswordName
+
+  $target = if ($existing) { "IT Glue password '$resolvedPasswordName' (id: $($existing.id))" } else { "IT Glue password '$resolvedPasswordName' (new)" }
+  $result = $null
+  if ($PSCmdlet.ShouldProcess($target, "Upsert LAPS password")) {
+    if ($existing) {
+      $result = Set-ITGluePassword `
+        -BaseUri $ITGlueBaseUri `
+        -ApiKey $ITGlueApiKey `
+        -PasswordId $existing.id `
+        -OrganizationId $ITGlueOrganizationId `
+        -Name $resolvedPasswordName `
+        -Username $laps.AccountName `
+        -Password $laps.Password `
+        -Notes $combinedNotes `
+        -PasswordCategoryId $ITGluePasswordCategoryId `
+        -ResourceType $resolvedResourceType `
+        -ResourceId $resolvedResourceId
+    } else {
+      $result = New-ITGluePassword `
+        -BaseUri $ITGlueBaseUri `
+        -ApiKey $ITGlueApiKey `
+        -OrganizationId $ITGlueOrganizationId `
+        -Name $resolvedPasswordName `
+        -Username $laps.AccountName `
+        -Password $laps.Password `
+        -Notes $combinedNotes `
+        -PasswordCategoryId $ITGluePasswordCategoryId `
+        -ResourceType $resolvedResourceType `
+        -ResourceId $resolvedResourceId
+    }
+  }
+
+  $resultId = $null
+  if ($existing) {
+    $resultId = $existing.id
+  } elseif ($result -and $result.data -and $result.data.id) {
+    $resultId = $result.data.id
+  }
+
+  [PSCustomObject]@{
+    DeviceName                 = $laps.DeviceName
+    DeviceId                   = $laps.DeviceId
+    AccountName                = $laps.AccountName
+    PasswordExpirationDateTime = $laps.PasswordExpirationDateTime
+    ITGlueOrganizationId       = $ITGlueOrganizationId
+    ITGluePasswordName         = $resolvedPasswordName
+    ITGluePasswordId           = $resultId
+    ITGlueResourceType         = $resolvedResourceType
+    ITGlueResourceId           = $resolvedResourceId
+  }
+}
+
+$scopes = @("DeviceLocalCredential.Read.All", "Device.Read.All")
+$needsManagedDevicesSerial =
   (-not $DisableConfigurationLookup) -and
   (-not $ITGlueResourceId) -and
   (-not $ConfigurationSerialNumber) -and
   ((-not $ITGlueResourceType) -or ($ITGlueResourceType -eq "Configurations"))
+if ($needsManagedDevicesSerial) { $scopes += "DeviceManagementManagedDevices.Read.All" }
 
-$laps = Get-EntraLapsCredential `
-  -DeviceName $DeviceName `
-  -LocalAdminAccountName $LocalAdminAccountName `
-  -TenantId $TenantId `
-  -IncludeManagedDeviceSerialLookup:$includeManagedDeviceSerialLookup
+Ensure-MgGraphConnection -Scopes $scopes -TenantId $TenantId
 
-$resolvedResourceType = $ITGlueResourceType
-$resolvedResourceId = $ITGlueResourceId
-
-if (
-  (-not $DisableConfigurationLookup) -and
-  (-not $resolvedResourceId) -and
-  ((-not $resolvedResourceType) -or ($resolvedResourceType -eq "Configurations"))
-) {
-  $serial = $ConfigurationSerialNumber
-  if (-not $serial) {
-    $serial = Get-EntraDeviceSerialNumber -AzureAdDeviceId $laps.AzureAdDeviceId -PhysicalIds $laps.PhysicalIds -DeviceName $laps.DeviceName
-  }
-
-  if ($serial) {
+if ($PSCmdlet.ParameterSetName -eq "All") {
+  $devices = @(Get-EntraDevicesWithLapsEnabled)
+  foreach ($device in $devices) {
     try {
-      $config = Get-ITGlueConfigurationBySerialNumber -BaseUri $ITGlueBaseUri -ApiKey $ITGlueApiKey -OrganizationId $ITGlueOrganizationId -SerialNumber $serial
-      if ($config) {
-        if (-not $resolvedResourceType) { $resolvedResourceType = "Configurations" }
-        $resolvedResourceId = [int]$config.id
-      } elseif ($RequireConfigurationMatch) {
-        throw "No IT Glue Configuration found with serial number '$serial' in org $ITGlueOrganizationId."
-      } else {
-        Write-Warning "No IT Glue Configuration found with serial number '$serial' in org $ITGlueOrganizationId. Continuing without resource association."
-      }
+      Sync-DeviceLapsToITGlue -Device $device
     } catch {
-      if ($RequireConfigurationMatch) { throw }
-      Write-Warning "Failed to resolve IT Glue Configuration by serial number. Continuing without resource association. Error: $($_.Exception.Message)"
+      Write-Warning "Failed syncing LAPS for '$($device.DisplayName)' ($($device.Id)). Error: $($_.Exception.Message)"
     }
-  } elseif ($RequireConfigurationMatch) {
-    throw "Unable to determine device serial number from Microsoft Graph. Pass -ConfigurationSerialNumber, or disable serial-based association with -DisableConfigurationLookup."
-  } else {
-    Write-Warning "Unable to determine device serial number from Microsoft Graph; skipping IT Glue Configuration association."
   }
-}
-
-$noteParts = @()
-if ($ITGlueNotes) { $noteParts += $ITGlueNotes.Trim() }
-if ($laps.BackupDateTime) { $noteParts += "Graph backupDateTime: $($laps.BackupDateTime)" }
-if ($laps.PasswordExpirationDateTime) { $noteParts += "Graph passwordExpirationDateTime: $($laps.PasswordExpirationDateTime)" }
-$combinedNotes = ($noteParts -join "`n").Trim()
-if (-not $combinedNotes) { $combinedNotes = $null }
-
-$existing = Get-ITGluePasswordByName -BaseUri $ITGlueBaseUri -ApiKey $ITGlueApiKey -OrganizationId $ITGlueOrganizationId -Name $ITGluePasswordName
-
-$target = if ($existing) { "IT Glue password '$ITGluePasswordName' (id: $($existing.id))" } else { "IT Glue password '$ITGluePasswordName' (new)" }
-if ($PSCmdlet.ShouldProcess($target, "Upsert LAPS password")) {
-  if ($existing) {
-    $result = Set-ITGluePassword `
-      -BaseUri $ITGlueBaseUri `
-      -ApiKey $ITGlueApiKey `
-      -PasswordId $existing.id `
-      -OrganizationId $ITGlueOrganizationId `
-      -Name $ITGluePasswordName `
-      -Username $laps.AccountName `
-      -Password $laps.Password `
-      -Notes $combinedNotes `
-      -PasswordCategoryId $ITGluePasswordCategoryId `
-      -ResourceType $resolvedResourceType `
-      -ResourceId $resolvedResourceId
-  } else {
-    $result = New-ITGluePassword `
-      -BaseUri $ITGlueBaseUri `
-      -ApiKey $ITGlueApiKey `
-      -OrganizationId $ITGlueOrganizationId `
-      -Name $ITGluePasswordName `
-      -Username $laps.AccountName `
-      -Password $laps.Password `
-      -Notes $combinedNotes `
-      -PasswordCategoryId $ITGluePasswordCategoryId `
-      -ResourceType $resolvedResourceType `
-      -ResourceId $resolvedResourceId
-  }
-}
-
-$resultId = $null
-if ($existing) {
-  $resultId = $existing.id
-} elseif ($result -and $result.data -and $result.data.id) {
-  $resultId = $result.data.id
-}
-
-[PSCustomObject]@{
-  DeviceName                 = $laps.DeviceName
-  DeviceId                   = $laps.DeviceId
-  AccountName                = $laps.AccountName
-  PasswordExpirationDateTime = $laps.PasswordExpirationDateTime
-  ITGlueOrganizationId       = $ITGlueOrganizationId
-  ITGluePasswordName         = $ITGluePasswordName
-  ITGluePasswordId           = $resultId
-  ITGlueResourceType         = $resolvedResourceType
-  ITGlueResourceId           = $resolvedResourceId
+} else {
+  $device = Get-MgDevice -Filter "displayName eq '$(ConvertTo-GraphODataStringLiteral -Value $DeviceName)'" -All -Property "id,deviceId,displayName,physicalIds"
+  if (-not $device) { throw "No Entra ID device found with displayName '$DeviceName'." }
+  if ($device.Count -gt 1) { throw "Multiple Entra ID devices found with displayName '$DeviceName'. Use a unique name." }
+  Sync-DeviceLapsToITGlue -Device $device[0]
 }

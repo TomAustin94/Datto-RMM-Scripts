@@ -5,6 +5,7 @@
 ## What it does
 
 - Looks up an Entra device by `displayName` (`-DeviceName`)
+- Or enumerates all devices with LAPS (`-AllDevices`) for bulk sync
 - Calls the Graph **beta** `deviceLocalCredentials` endpoint to retrieve LAPS credentials
 - Selects the credential matching `-LocalAdminAccountName` (falls back to the first credential returned)
 - Creates or updates an IT Glue Password record (matched by name) with:
@@ -50,6 +51,14 @@ Basic sync (creates the IT Glue Password record if it doesn’t exist):
   -ITGlueOrganizationId 123456
 ```
 
+Bulk sync all devices with LAPS enabled:
+
+```powershell
+.\scripts\Sync-EntraLapsToITGlue.ps1 `
+  -AllDevices `
+  -ITGlueOrganizationId 123456
+```
+
 If running from Datto RMM as a component, set an environment/component variable like `ITGLUE_API_KEY`
 and omit `-ITGlueApiKey`.
 
@@ -75,11 +84,13 @@ Use a specific local admin account name and a custom IT Glue Password record nam
 
 ## Parameters
 
-- `-DeviceName` (required): Entra device `displayName` (must be unique).
+- `-DeviceName`: Entra device `displayName` (must be unique; required unless using `-AllDevices`).
+- `-AllDevices`: Enumerate and sync all devices with LAPS credentials (bulk mode).
 - `-LocalAdminAccountName`: Which credential to select (default: `Administrator`).
-- `-ITGlueApiKey` (required): IT Glue API key (sent in the `x-api-key` header).
+- `-ITGlueApiKey`: IT Glue API key (sent in the `x-api-key` header); if omitted, uses `ITGLUE_API_KEY` env var.
 - `-ITGlueOrganizationId` (required): IT Glue organization that owns the Password record.
-- `-ITGluePasswordName`: Password record name to upsert (default: `"<DeviceName> - LAPS"`).
+- `-ITGluePasswordName`: Password record name to upsert (single-device mode only; overrides template).
+- `-ITGluePasswordNameTemplate`: Per-device password name template (default: `"{DeviceName} - LAPS"`).
 - `-ITGlueBaseUri`: IT Glue API base URL (default: `https://api.itglue.com`).
 - `-ITGluePasswordCategoryId`: Optional password category ID to set on create/update.
 - `-ITGlueResourceType` / `-ITGlueResourceId`: Optional association (commonly `Configurations` + configuration ID).
