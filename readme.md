@@ -1,6 +1,14 @@
-# Sync Entra LAPS to IT Glue
+# Datto RMM Automation Scripts
+
+This repo is a small collection of PowerShell scripts written to automate common tasks for devices managed by **Datto RMM**, including syncing credentials into **IT Glue**.
+
+## Scripts
+
+### Sync Entra LAPS to IT Glue
 
 `scripts/Sync-EntraLapsToITGlue.ps1` retrieves a Windows LAPS password stored in Entra ID (Azure AD) via Microsoft Graph and upserts it into an IT Glue **Password** record.
+
+`scripts/Set-LocalAdminAndSyncToITGlue.ps1` creates/updates a local admin account on a Windows PC and upserts that credential into IT Glue, associating it to the device Configuration by serial number.
 
 ## What it does
 
@@ -62,6 +70,15 @@ Bulk sync all devices with LAPS enabled:
 If running from Datto RMM as a component, set an environment/component variable like `ITGLUE_API_KEY`
 and omit `-ITGlueApiKey`.
 
+Create/update a local admin on the endpoint and sync it to IT Glue (Datto RMM component-friendly):
+
+```powershell
+$env:LOCAL_ADMIN_PASSWORD = "<set via Datto RMM component variable>"
+$env:ITGLUE_API_KEY = "<set via Datto RMM component variable>"
+
+.\scripts\Set-LocalAdminAndSyncToITGlue.ps1 -LocalAdminUsername "RMMAdmin"
+```
+
 Preview changes without writing to IT Glue:
 
 ```powershell
@@ -114,6 +131,12 @@ The script returns an object including:
 - The device lookup is by exact `displayName`. If multiple devices share the same name, the script stops and asks for a unique name.
 - IT Glue upsert is done by searching Passwords by **name** within the given organization (first match is used).
 - If `-ITGlueResourceId` is not provided, the script attempts to associate the Password to an IT Glue **Configuration** by looking up the device serial number in Graph and matching `filter[serial_number]` in IT Glue.
+
+## Local admin sync notes
+
+- `scripts/Set-LocalAdminAndSyncToITGlue.ps1` resolves the endpoint serial number from `Win32_BIOS.SerialNumber` and finds the IT Glue Configuration via `filter[serial_number]`.
+- The local admin password should be provided via a Datto RMM variable mapped to `LOCAL_ADMIN_PASSWORD` (or passed as `-LocalAdminPassword`).
+- The IT Glue Password record is upserted; it prefers matching by name, and may also update an existing record associated with the same Configuration+username when supported by IT Glue filters.
 
 ## Security recommendations
 
