@@ -10,6 +10,35 @@ This repo is a small collection of PowerShell scripts written to automate common
 
 `scripts/Set-LocalAdminAndSyncToITGlue.ps1` creates/updates a local admin account on a Windows PC and upserts that credential into IT Glue, associating it to the device Configuration by serial number.
 
+### Reset AD user password
+
+`scripts/Reset-ADPassword.ps1` runs on a Domain Controller, resets a single Active Directory user password, and unlocks the account.
+
+#### Purpose & behavior
+- Imports the `ActiveDirectory` module (requires Domain Admin or equivalent context) and ensures the target user exists in AD.
+- Stops if the user is a member of **Domain Admins** or the built-in **Administrators** group to prevent high-privilege resets.
+- Converts the provided `-Password` to a secure string, resets the password, and unlocks the account if it was locked.
+
+#### Requirements
+- Must run on a writable Domain Controller with the Active Directory PowerShell module available.
+- Caller must have sufficient rights to query group membership and reset the specified account (typically Domain Admin or Account Operator privileges).
+
+#### Usage
+```powershell
+.\scripts\Reset-ADPassword.ps1 `
+  -Username "jdoe" `
+  -Password "N3wP@ssword123!"
+```
+
+#### Parameters
+- `-Username` (required): sAMAccountName of the AD user to reset.
+- `-Password` (required): new password in plain text; the script converts it to a secure string before the reset.
+
+#### Notes
+- Intended for automation runbooks or scheduled maintenance where a known service account manages user passwords.
+- Because the command accepts plaintext passwords, supply the value through secure pipelines or vaults whenever possible.
+- The command emits an error and exits with code 2 or 3 when the user is part of privileged groups, keeping your admin role intact.
+
 ## What it does
 
 - Looks up an Entra device by `displayName` (`-DeviceName`)
